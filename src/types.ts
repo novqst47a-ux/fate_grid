@@ -86,6 +86,8 @@ export interface CharacterNode {
   slotsRemaining: number;
   x: number;
   y: number;
+  /** 0 = PROTAG (excluded from alphabet suffix); 1–26 = user-placed cards (A–Z). */
+  placementIndex: number;
 }
 
 export interface Link {

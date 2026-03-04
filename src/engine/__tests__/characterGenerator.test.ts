@@ -128,4 +128,42 @@ describe('generateNextCard', () => {
       expect(validPersonalities).toContain(card.personality);
     }
   });
+
+  it('EXTRA appears roughly 8–15 % of the time (weighted)', () => {
+    const SAMPLES = 2000;
+    let extraCount = 0;
+    const rng = createRNG(777);
+    for (let i = 0; i < SAMPLES; i++) {
+      if (generateNextCard(rng).position === 'EXTRA') extraCount++;
+    }
+    const ratio = extraCount / SAMPLES;
+    // Target ≈9.5 %; allow generous ±6 pp tolerance for randomness
+    expect(ratio).toBeGreaterThanOrEqual(0.04);
+    expect(ratio).toBeLessThanOrEqual(0.20);
+  });
+
+  it('EXTRA is less frequent than SUPPORT over many samples', () => {
+    const SAMPLES = 1000;
+    let extraCount = 0;
+    let supportCount = 0;
+    const rng = createRNG(123);
+    for (let i = 0; i < SAMPLES; i++) {
+      const { position } = generateNextCard(rng);
+      if (position === 'EXTRA')   extraCount++;
+      if (position === 'SUPPORT') supportCount++;
+    }
+    expect(extraCount).toBeLessThan(supportCount);
+  });
+});
+
+describe('createCharacterNode — placementIndex', () => {
+  it('defaults placementIndex to 0 when omitted', () => {
+    const node = createCharacterNode('x', 'Test', 'PROTAG', 'CALM', 0, 0, createRNG(1));
+    expect(node.placementIndex).toBe(0);
+  });
+
+  it('stores the supplied placementIndex', () => {
+    const node = createCharacterNode('x', 'Test', 'SUPPORT', 'BRIGHT', 1, 2, createRNG(1), 5);
+    expect(node.placementIndex).toBe(5);
+  });
 });

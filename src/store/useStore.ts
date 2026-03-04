@@ -5,6 +5,7 @@ import {
   Position,
   Personality,
   NextCard,
+  PositionLabels,
 } from '../types';
 import { createRNG, randomSeed } from '../engine/rng';
 import { createCharacterNode, generateNextCard } from '../engine/characterGenerator';
@@ -26,6 +27,7 @@ export interface GameStore {
   initSession: () => void;
   setupProtag: (name: string, personality: Personality) => void;
   placeCard: (x: number, y: number) => boolean;
+  renameNode: (id: string, newName: string) => void;
   reroll: () => void;
   reset: () => void;
 }
@@ -34,6 +36,21 @@ export interface GameStore {
 
 function makeRNG(seed: number) {
   return createRNG(seed);
+}
+
+/** A-Z suffix string from a 1-based placement index. */
+function suffixLetter(placementIndex: number): string {
+  return String.fromCharCode(64 + placementIndex); // 1→'A', 2→'B', ...
+}
+
+/** Default display name for a newly placed card. */
+function defaultCardName(position: Position, placementIndex: number): string {
+  return `${PositionLabels[position]}${suffixLetter(placementIndex)}`;
+}
+
+/** Migrate a node from an older saved session that may lack placementIndex. */
+function migrateNode(n: CharacterNode): CharacterNode {
+  return { ...n, placementIndex: n.placementIndex ?? 0 };
 }
 
 // ─── Store ────────────────────────────────────────────────────────────────────
@@ -49,48 +66,25 @@ export const useStore = create<GameStore>((set, get) => ({
   initSession() {
     const saved = loadSession();
     if (saved && saved.nodes.length > 0) {
+      const nodes = saved.nodes.map(migrateNode);
       const rng = makeRNG(saved.seed);
       const nextCard = generateNextCard(rng);
-      const protagReady = saved.nodes.find((n) => n.position === 'PROTAG')?.name !== '';
-      set({
-        nodes: saved.nodes,
-        links: saved.links,
-        seed: saved.seed,
-        nextCard,
-        protagReady: !!protagReady,
-      });
+      const protagReady = nodes.find((n) => n.position === 'PROTAG')?.name !== '';
+      set({ nodes, links: saved.links, seed: saved.seed, nextCard, protagReady: !!protagReady });
     } else {
-      // Fresh session: place unnamed PROTAG at center
       const seed = randomSeed();
       const rng = makeRNG(seed);
-      const protag: CharacterNode = createCharacterNode(
-        'protag_0',
-        '', // Name filled in SetupModal
-        'PROTAG',
-        'SOCIAL', // temporary; overridden in setupProtag
-        0,
-        0,
-        rng,
-      );
+      const protag = createCharacterNode('protag_0', '', 'PROTAG', 'SOCIAL', 0, 0, rng, 0);
       set({ nodes: [protag], links: [], seed, nextCard: null, protagReady: false });
     }
   },
 
-  /** User submits PROTAG name + personality. */
+  /** User submits PROTAG name + personality via SetupModal. */
   setupProtag(name: string, personality: Personality) {
     const { nodes, seed } = get();
     const rng = makeRNG(seed);
     const protag = nodes[0];
-    // Recalculate stats with chosen personality
-    const updated = createCharacterNode(
-      protag.id,
-      name,
-      'PROTAG',
-      personality,
-      protag.x,
-      protag.y,
-      rng,
-    );
+    const updated = createCharacterNode(protag.id, name, 'PROTAG', personality, protag.x, protag.y, rng, 0);
     const nextCard = generateNextCard(rng);
     const newNodes = [updated];
     saveSession({ nodes: newNodes, links: [], seed });
@@ -99,7 +93,7 @@ export const useStore = create<GameStore>((set, get) => ({
 
   /**
    * Place the current nextCard at grid (x, y).
-   * Returns false if cell is occupied or limit reached.
+   * Returns false if cell is occupied or the 27-card limit is reached.
    */
   placeCard(x: number, y: number): boolean {
     const { nodes, links, seed, nextCard } = get();
@@ -107,33 +101,29 @@ export const useStore = create<GameStore>((set, get) => ({
     if (nodes.length >= 27) return false;
     if (nodes.some((n) => n.x === x && n.y === y)) return false;
 
-    const rng = makeRNG(seed + nodes.length); // advance seed deterministically
+    // placementIndex counts only user-placed (non-PROTAG) cards, 1-based → A–Z
+    const userPlacedSoFar = nodes.filter((n) => n.position !== 'PROTAG').length;
+    const placementIndex = userPlacedSoFar + 1;
+    const cardName = defaultCardName(nextCard.position, placementIndex);
+
+    const rng = makeRNG(seed + nodes.length);
     const newNode = createCharacterNode(
       `char_${nodes.length}_${Date.now()}`,
-      nextCard.position, // name defaults to position label; user can't rename for now
+      cardName,
       nextCard.position,
       nextCard.personality,
       x,
       y,
       rng,
+      placementIndex,
     );
 
-    const { newLinks, updatedExisting, updatedNew } = generateLinks(
-      newNode,
-      nodes,
-      links,
-      rng,
-    );
+    const { newLinks, updatedExisting, updatedNew } = generateLinks(newNode, nodes, links, rng);
 
-    // Merge updated existing nodes
-    const mergedNodes = nodes.map((n) => {
-      const updated = updatedExisting.find((u) => u.id === n.id);
-      return updated ?? n;
-    });
+    const mergedNodes = nodes.map((n) => updatedExisting.find((u) => u.id === n.id) ?? n);
     mergedNodes.push(updatedNew);
     const mergedLinks = [...links, ...newLinks];
 
-    // Generate next card
     const nextRng = makeRNG(seed + mergedNodes.length);
     const newNextCard = generateNextCard(nextRng);
 
@@ -142,9 +132,17 @@ export const useStore = create<GameStore>((set, get) => ({
     return true;
   },
 
-  /** Keep nodes/coordinates; delete all links and regenerate. */
+  /** Rename an existing node; persists immediately to LocalStorage. */
+  renameNode(id: string, newName: string) {
+    const { nodes, links, seed } = get();
+    const updatedNodes = nodes.map((n) => (n.id === id ? { ...n, name: newName } : n));
+    saveSession({ nodes: updatedNodes, links, seed });
+    set({ nodes: updatedNodes });
+  },
+
+  /** Keep node positions; delete all links and regenerate relationships. */
   reroll() {
-    const { nodes, seed } = get();
+    const { nodes } = get();
     const newSeed = randomSeed();
     const rng = makeRNG(newSeed);
     const { links: newLinks, updatedNodes } = rerollLinks(nodes, rng);
@@ -152,12 +150,12 @@ export const useStore = create<GameStore>((set, get) => ({
     set({ nodes: updatedNodes, links: newLinks, seed: newSeed });
   },
 
-  /** Delete everything; restart with a fresh PROTAG. */
+  /** Delete everything; restart with a fresh unnamed PROTAG. */
   reset() {
     clearSession();
     const seed = randomSeed();
     const rng = makeRNG(seed);
-    const protag = createCharacterNode('protag_0', '', 'PROTAG', 'SOCIAL', 0, 0, rng);
+    const protag = createCharacterNode('protag_0', '', 'PROTAG', 'SOCIAL', 0, 0, rng, 0);
     set({ nodes: [protag], links: [], seed, nextCard: null, protagReady: false });
   },
 }));

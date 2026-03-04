@@ -73,14 +73,29 @@ export function createCharacterNode(
   x: number,
   y: number,
   rng: () => number,
+  placementIndex = 0,
 ): CharacterNode {
   const { range, slots } = calculateStats(position, personality, rng);
-  return { id, name, position, personality, range, slots, slotsRemaining: slots, x, y };
+  return { id, name, position, personality, range, slots, slotsRemaining: slots, x, y, placementIndex };
 }
 
 // ─── Next card generation ─────────────────────────────────────────────────────
 
-const CARD_POSITIONS: Position[] = ['SUPPORT', 'RIVAL', 'VILLAIN', 'MENTOR', 'EXTRA'];
+/**
+ * Weighted position pool. EXTRA is intentionally low (~10%) so that
+ * roughly 2–3 EXTRAs appear across the full 26 user-placed cards.
+ * Weights: SUPPORT=30, RIVAL=25, VILLAIN=20, MENTOR=20, EXTRA=10 → total=105
+ * EXTRA share ≈ 10/105 ≈ 9.5 %
+ */
+const CARD_POSITION_WEIGHTS: [Position, number][] = [
+  ['SUPPORT', 30],
+  ['RIVAL', 25],
+  ['VILLAIN', 20],
+  ['MENTOR', 20],
+  ['EXTRA', 10],
+];
+const CARD_POSITION_TOTAL = CARD_POSITION_WEIGHTS.reduce((s, [, w]) => s + w, 0);
+
 const CARD_PERSONALITIES: Personality[] = [
   'SOCIAL', 'BRIGHT', 'INTRO', 'CYNICAL', 'MAD', 'CALM', 'AGGRESSIVE', 'TIMID',
 ];
@@ -88,7 +103,12 @@ const CARD_PERSONALITIES: Personality[] = [
 export function generateNextCard(
   rng: () => number,
 ): { position: Position; personality: Personality } {
-  const position = CARD_POSITIONS[Math.floor(rng() * CARD_POSITIONS.length)];
+  let rand = rng() * CARD_POSITION_TOTAL;
+  let position: Position = CARD_POSITION_WEIGHTS[0][0];
+  for (const [pos, weight] of CARD_POSITION_WEIGHTS) {
+    rand -= weight;
+    if (rand <= 0) { position = pos; break; }
+  }
   const personality = CARD_PERSONALITIES[Math.floor(rng() * CARD_PERSONALITIES.length)];
   return { position, personality };
 }
