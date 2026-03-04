@@ -2,6 +2,7 @@ import React, { useRef, useState, useCallback, useEffect } from 'react';
 import {
   CharacterNode,
   Link,
+  Emotion,
   NextCard,
   EmotionColors,
   PositionColors,
@@ -14,94 +15,196 @@ import { createRNG } from '../engine/rng';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const CELL = 100;        // px per grid unit (world coords)
-const NODE_W = 80;
-const NODE_H = 48;
-const GRID_HALF = 8;     // grid spans -8 to +8 in each axis
-const CURVE_OFFSET = 22; // world-px perpendicular offset for bidirectional curves
+const CELL        = 100; // px per grid unit (world coords)
+const NODE_W      = 80;
+const NODE_H      = 48;
+const GRID_HALF   = 8;   // grid spans -8 to +8 in each axis
+const CURVE_OFFSET = 22; // world-px perpendicular offset for Type-3 curves
+const ARROW_SIZE  = 9;   // arrowhead length in userSpaceOnUse px
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-const wx = (x: number) => x * CELL; // grid → world x
-const wy = (y: number) => y * CELL; // grid → world y
+const wx = (x: number) => x * CELL;
+const wy = (y: number) => y * CELL;
 
-// ─── Bidirectional curve path ─────────────────────────────────────────────────
+/**
+ * Given a line from external point A toward node-center C,
+ * returns the point on the node's rectangular boundary where the line enters.
+ *
+ * Parameterisation: P(t) = A + t*(C-A), where t=0→A, t=1→C.
+ * Crossing t* = max( 1 - hw/|ax-cx|,  1 - hh/|ay-cy|,  0 ).
+ */
+function rectEdge(
+  ax: number, ay: number,
+  cx: number, cy: number,
+  hw = NODE_W / 2,
+  hh = NODE_H / 2,
+): { x: number; y: number } {
+  const ddx = Math.abs(ax - cx);
+  const ddy = Math.abs(ay - cy);
+  const tx  = ddx < 0.001 ? 0 : 1 - hw / ddx;
+  const ty  = ddy < 0.001 ? 0 : 1 - hh / ddy;
+  const t   = Math.max(tx, ty, 0);
+  return { x: ax + t * (cx - ax), y: ay + t * (cy - ay) };
+}
+
+// ─── Arrow marker defs (one per emotion colour) ───────────────────────────────
+
+const EMOTION_KEYS: Emotion[] = ['Love', 'Friendly', 'Hostile', 'Awkward'];
+
+/**
+ * SVG <marker> elements for arrowheads.
+ *   markerUnits="userSpaceOnUse"  → absolute world-px sizes, zoom-stable
+ *   refX = ARROW_SIZE             → tip aligns with the path endpoint
+ *   Triangle: tip at (ARROW_SIZE, ARROW_SIZE/2), base at x=0
+ */
+const ArrowMarkerDefs: React.FC = () => (
+  <>
+    {EMOTION_KEYS.map((emotion) => (
+      <marker
+        key={emotion}
+        id={`arrow-${emotion}`}
+        markerWidth={ARROW_SIZE}
+        markerHeight={ARROW_SIZE}
+        refX={ARROW_SIZE}
+        refY={ARROW_SIZE / 2}
+        orient="auto"
+        markerUnits="userSpaceOnUse"
+      >
+        <path
+          d={`M0,0 L${ARROW_SIZE},${ARROW_SIZE / 2} L0,${ARROW_SIZE} Z`}
+          fill={EmotionColors[emotion]}
+        />
+      </marker>
+    ))}
+  </>
+);
+
+// ─── Three-tiered RelationLine ────────────────────────────────────────────────
 
 interface RelationLineProp {
   link: Link;
   nodes: CharacterNode[];
-  /** Set of "from|to" keys for every existing link (used for reverse-link detection). */
-  linkKeySet: Set<string>;
+  /**
+   * Map of "from|to" → Link for O(1) reverse-link lookup.
+   * Used to determine which of the three visual types to render.
+   */
+  linkMap: Map<string, Link>;
 }
 
-const RelationLine: React.FC<RelationLineProp> = ({ link, nodes, linkKeySet }) => {
-  const from = nodes.find((n) => n.id === link.from);
-  const to   = nodes.find((n) => n.id === link.to);
-  if (!from || !to) return null;
+const RelationLine: React.FC<RelationLineProp> = ({ link, nodes, linkMap }) => {
+  const fromNode = nodes.find((n) => n.id === link.from);
+  const toNode   = nodes.find((n) => n.id === link.to);
+  if (!fromNode || !toNode) return null;
 
-  const x1 = wx(from.x);
-  const y1 = wy(from.y);
-  const x2 = wx(to.x);
-  const y2 = wy(to.y);
-  const color = EmotionColors[link.emotion];
+  const cx1 = wx(fromNode.x), cy1 = wy(fromNode.y); // source center (world)
+  const cx2 = wx(toNode.x),   cy2 = wy(toNode.y);   // target center (world)
 
-  // Detect whether a reverse link also exists
-  const reverseKey = `${link.to}|${link.from}`;
-  const isBidirectional = linkKeySet.has(reverseKey);
+  const reverseLink = linkMap.get(`${link.to}|${link.from}`);
+  const color       = EmotionColors[link.emotion];
+  const arrowUrl    = `url(#arrow-${link.emotion})`;
 
-  // For bidirectional pairs we need a consistent "is this the forward direction?"
-  // so that the two curves offset in opposite directions.
-  const isForward = link.from < link.to; // lexicographic — stable & deterministic
+  // Shared label text-element props
+  const labelProps = (x: number, y: number, c: string) => ({
+    x, y,
+    textAnchor:  'middle' as const,
+    fontSize:    9,
+    fill:        c,
+    stroke:      '#0f0f1a',
+    strokeWidth: 2.5,
+    paintOrder:  'stroke' as const,
+  });
 
-  let pathD: string;
-  let labelX: number;
-  let labelY: number;
+  // ──────────────────────────────────────────────────────────────────────────
+  // TYPE 1 — Bidirectional + SAME emotion: single solid line, NO arrowheads.
+  // Deduplicate by rendering only for the lexicographically forward direction.
+  // ──────────────────────────────────────────────────────────────────────────
+  if (reverseLink && reverseLink.emotion === link.emotion) {
+    if (link.from > link.to) return null; // skip the reverse duplicate
 
-  if (isBidirectional) {
-    // Compute perpendicular unit vector
-    const dx = x2 - x1;
-    const dy = y2 - y1;
+    const p1 = rectEdge(cx2, cy2, cx1, cy1); // leave source edge
+    const p2 = rectEdge(cx1, cy1, cx2, cy2); // arrive at target edge
+    const mx = (p1.x + p2.x) / 2;
+    const my = (p1.y + p2.y) / 2;
+
+    // Both sub-categories on one line (merged if identical)
+    const subA  = link.subCategory;
+    const subB  = reverseLink.subCategory;
+    const label = subA === subB ? subA : `${subA} · ${subB}`;
+
+    return (
+      <g>
+        <line
+          x1={p1.x} y1={p1.y} x2={p2.x} y2={p2.y}
+          stroke={color}
+          strokeWidth={2.5}
+          strokeOpacity={0.85}
+        />
+        <text {...labelProps(mx, my - 7, color)}>{label}</text>
+      </g>
+    );
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // TYPE 3 — Bidirectional + DIFFERENT emotions: two Bezier curves, each
+  // with its own arrowhead, offset to opposite sides of the straight line.
+  // ──────────────────────────────────────────────────────────────────────────
+  if (reverseLink) {
+    const dx  = cx2 - cx1;
+    const dy  = cy2 - cy1;
     const len = Math.hypot(dx, dy) || 1;
+    // Perpendicular unit vector (90° counter-clockwise rotation)
     const perpX = -dy / len;
     const perpY =  dx / len;
 
-    const sign = isForward ? 1 : -1;
-    const cpX = (x1 + x2) / 2 + sign * CURVE_OFFSET * perpX;
-    const cpY = (y1 + y2) / 2 + sign * CURVE_OFFSET * perpY;
+    // Consistent sign: forward (from < to lexicographically) → positive side
+    const sign = link.from < link.to ? 1 : -1;
+    const cpX  = (cx1 + cx2) / 2 + sign * CURVE_OFFSET * perpX;
+    const cpY  = (cy1 + cy2) / 2 + sign * CURVE_OFFSET * perpY;
 
-    pathD = `M ${x1},${y1} Q ${cpX},${cpY} ${x2},${y2}`;
+    // Clip to rectangle edges using the curve's approach angle
+    const startPt = rectEdge(cpX, cpY, cx1, cy1);
+    const endPt   = rectEdge(cpX, cpY, cx2, cy2);
 
-    // Midpoint of quadratic bezier at t = 0.5:
-    // B(0.5) = 0.25*P0 + 0.5*CP + 0.25*P1
-    labelX = 0.25 * x1 + 0.5 * cpX + 0.25 * x2;
-    labelY = 0.25 * y1 + 0.5 * cpY + 0.25 * y2 - 5;
-  } else {
-    pathD = `M ${x1},${y1} L ${x2},${y2}`;
-    labelX = (x1 + x2) / 2;
-    labelY = (y1 + y2) / 2 - 5;
+    const pathD = `M ${startPt.x},${startPt.y} Q ${cpX},${cpY} ${endPt.x},${endPt.y}`;
+
+    // Label at Bezier midpoint t=0.5: B(½) = ¼·P0 + ½·CP + ¼·P1
+    const labX = 0.25 * startPt.x + 0.5 * cpX + 0.25 * endPt.x;
+    const labY = 0.25 * startPt.y + 0.5 * cpY + 0.25 * endPt.y - 5;
+
+    return (
+      <g>
+        <path
+          d={pathD}
+          stroke={color}
+          strokeWidth={2}
+          strokeOpacity={0.85}
+          fill="none"
+          markerEnd={arrowUrl}
+        />
+        <text {...labelProps(labX, labY, color)}>{link.subCategory}</text>
+      </g>
+    );
   }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // TYPE 2 — One-sided: straight line with a single arrowhead at the target.
+  // ──────────────────────────────────────────────────────────────────────────
+  const p1 = rectEdge(cx2, cy2, cx1, cy1); // leave source edge
+  const p2 = rectEdge(cx1, cy1, cx2, cy2); // arrive at target edge
+  const mx = (p1.x + p2.x) / 2;
+  const my = (p1.y + p2.y) / 2;
 
   return (
     <g>
-      <path
-        d={pathD}
+      <line
+        x1={p1.x} y1={p1.y} x2={p2.x} y2={p2.y}
         stroke={color}
         strokeWidth={2}
-        strokeOpacity={0.78}
-        fill="none"
+        strokeOpacity={0.85}
+        markerEnd={arrowUrl}
       />
-      <text
-        x={labelX}
-        y={labelY}
-        textAnchor="middle"
-        fontSize={9}
-        fill={color}
-        stroke="#0f0f1a"
-        strokeWidth={2.5}
-        paintOrder="stroke"
-      >
-        {link.subCategory}
-      </text>
+      <text {...labelProps(mx, my - 5, color)}>{link.subCategory}</text>
     </g>
   );
 };
@@ -223,12 +326,12 @@ export const GridBoard: React.FC<GridBoardProps> = ({
   onPlaceCard,
   onNodeEdit,
 }) => {
-  const svgRef = useRef<SVGSVGElement>(null);
+  const svgRef       = useRef<SVGSVGElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
   // ── Pan / zoom ──
-  const [tx, setTx] = useState(0);
-  const [ty, setTy] = useState(0);
+  const [tx, setTx]       = useState(0);
+  const [ty, setTy]       = useState(0);
   const [scale, setScale] = useState(1);
 
   // ── Hover / preview ──
@@ -236,11 +339,9 @@ export const GridBoard: React.FC<GridBoardProps> = ({
   const [previewLinks, setPreviewLinks] = useState<PreviewCandidate[]>([]);
 
   // ── Drag state ──
-  const dragRef = useRef<{
-    startX: number; startY: number; startTx: number; startTy: number;
-  } | null>(null);
-  const touchRef  = useRef<{ id: number; x: number; y: number }[]>([]);
-  const pinchRef  = useRef<number | null>(null);
+  const dragRef  = useRef<{ startX: number; startY: number; startTx: number; startTy: number } | null>(null);
+  const touchRef = useRef<{ id: number; x: number; y: number }[]>([]);
+  const pinchRef = useRef<number | null>(null);
 
   // Centre view on (0,0) once the container is mounted
   useEffect(() => {
@@ -348,8 +449,8 @@ export const GridBoard: React.FC<GridBoardProps> = ({
     e.preventDefault();
     const pos = getPointerSVG(e);
     if (!pos) return;
-    const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
-    const newScale = Math.min(3, Math.max(0.25, scale * factor));
+    const factor    = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+    const newScale  = Math.min(3, Math.max(0.25, scale * factor));
     setScale(newScale);
     setTx(pos.x - (pos.x - tx) * (newScale / scale));
     setTy(pos.y - (pos.y - ty) * (newScale / scale));
@@ -378,7 +479,7 @@ export const GridBoard: React.FC<GridBoardProps> = ({
       const dx = touchRef.current[1].x - touchRef.current[0].x;
       const dy = touchRef.current[1].y - touchRef.current[0].y;
       pinchRef.current = Math.hypot(dx, dy);
-      dragRef.current = null;
+      dragRef.current  = null;
     }
   };
 
@@ -395,12 +496,12 @@ export const GridBoard: React.FC<GridBoardProps> = ({
       setTx(dragRef.current.startTx + (touches[0].x - dragRef.current.startX));
       setTy(dragRef.current.startTy + (touches[0].y - dragRef.current.startY));
     } else if (touches.length === 2 && pinchRef.current !== null) {
-      const dx = touches[1].x - touches[0].x;
-      const dy = touches[1].y - touches[0].y;
-      const dist = Math.hypot(dx, dy);
+      const dx    = touches[1].x - touches[0].x;
+      const dy    = touches[1].y - touches[0].y;
+      const dist  = Math.hypot(dx, dy);
       const factor = dist / pinchRef.current;
-      const midX = (touches[0].x + touches[1].x) / 2;
-      const midY = (touches[0].y + touches[1].y) / 2;
+      const midX  = (touches[0].x + touches[1].x) / 2;
+      const midY  = (touches[0].y + touches[1].y) / 2;
       const newScale = Math.min(3, Math.max(0.25, scale * factor));
       setScale(newScale);
       setTx(midX - (midX - tx) * (newScale / scale));
@@ -415,11 +516,11 @@ export const GridBoard: React.FC<GridBoardProps> = ({
     const rect = svgRef.current!.getBoundingClientRect();
 
     if (e.changedTouches.length === 1 && dragRef.current && e.touches.length === 0) {
-      const t = e.changedTouches[0];
+      const t    = e.changedTouches[0];
       const endX = t.clientX - rect.left;
       const endY = t.clientY - rect.top;
-      const dx = Math.abs(endX - dragRef.current.startX);
-      const dy = Math.abs(endY - dragRef.current.startY);
+      const dx   = Math.abs(endX - dragRef.current.startX);
+      const dy   = Math.abs(endY - dragRef.current.startY);
 
       if (dx < 10 && dy < 10 && protagReady && nextCard && nodes.length < 27) {
         const grid = svgToGrid(endX, endY);
@@ -427,24 +528,24 @@ export const GridBoard: React.FC<GridBoardProps> = ({
       }
     }
 
-    dragRef.current = null;
+    dragRef.current  = null;
     pinchRef.current = null;
     touchRef.current = [];
     setHoveredCell(null);
     setPreviewLinks([]);
   };
 
-  // ── Pre-compute link key set for bidirectional detection ──────────────────
+  // ── Build linkMap for three-tier RelationLine logic ───────────────────────
 
-  const linkKeySet = new Set(links.map((l) => `${l.from}|${l.to}`));
+  const linkMap = new Map(links.map((l) => [`${l.from}|${l.to}`, l]));
 
   // ── Grid cell rendering ───────────────────────────────────────────────────
 
   const gridCells: React.ReactNode[] = [];
   for (let gxi = -GRID_HALF; gxi <= GRID_HALF; gxi++) {
     for (let gyi = -GRID_HALF; gyi <= GRID_HALF; gyi++) {
-      const cx = wx(gxi);
-      const cy = wy(gyi);
+      const cx   = wx(gxi);
+      const cy   = wy(gyi);
       const isHov = hoveredCell?.x === gxi && hoveredCell?.y === gyi;
       const isOcc = nodes.some((n) => n.x === gxi && n.y === gyi);
       gridCells.push(
@@ -485,13 +586,18 @@ export const GridBoard: React.FC<GridBoardProps> = ({
         onTouchEnd={handleTouchEnd}
         style={{ cursor: 'crosshair', touchAction: 'none' }}
       >
+        {/* Arrow marker definitions — one per emotion colour */}
+        <defs>
+          <ArrowMarkerDefs />
+        </defs>
+
         <g transform={transform}>
           {/* Grid cells */}
           {gridCells}
 
           {/* Relationship lines (rendered below nodes) */}
           {links.map((link) => (
-            <RelationLine key={link.id} link={link} nodes={nodes} linkKeySet={linkKeySet} />
+            <RelationLine key={link.id} link={link} nodes={nodes} linkMap={linkMap} />
           ))}
 
           {/* Preview dashed lines */}
